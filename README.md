@@ -6,13 +6,14 @@
 **Language:** Dart
 
 ### Requirements
+
 - Flutter SDK
 - Android Studio or VS Code
 - Android device or emulator
 
 ### Build and Run
 
-Open the project folder in the terminal and run:
+Open the project folder in the terminal and run these commands one by one:
 
 ```bash
 flutter pub get
@@ -29,6 +30,6 @@ To generate a debug APK:
 flutter build apk --debug
 ```
 
-APK location:
+**APK Location:**
 
 `build/app/outputs/flutter-apk/app-debug.apk`
