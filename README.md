@@ -1,9 +1,19 @@
+# Vanish Class Network
 
 ## Setup and Run
 
 **Platform:** Android  
 **Framework:** Flutter  
 **Language:** Dart
+
+### Relay Address
+
+`wss://vanish-relay-sawaira.bonto.page/ws`
+
+**Protocol:** WebSocket, JSON text frames  
+**Protocol Version:** 1
+
+See [PROTOCOL.md](PROTOCOL.md) for protocol details.
 
 ### Requirements
 
@@ -13,7 +23,7 @@
 
 ### Build and Run
 
-Open the project folder in the terminal and run these commands one by one:
+Run these commands one by one:
 
 ```bash
 flutter pub get

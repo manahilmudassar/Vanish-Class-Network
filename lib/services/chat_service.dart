@@ -1,10 +1,12 @@
 import 'dart:async';
+import 'dart:developer' as developer;
 import 'package:flutter/widgets.dart';
 import 'package:uuid/uuid.dart';
 import '../models/chat_message.dart';
 import '../utils/constants.dart';
 import 'connectivity_service.dart';
 import 'device_service.dart';
+import 'message_database_service.dart';
 import 'time_sync_service.dart';
 import 'websocket_relay_service.dart';
 
@@ -26,6 +28,8 @@ class ChatService extends ChangeNotifier with WidgetsBindingObserver {
   final TimeSyncService _timeSyncService = TimeSyncService();
   final ConnectivityService _connectivityService = ConnectivityService();
   final WebSocketRelayService _relayService = WebSocketRelayService();
+  final MessageDatabaseService _messageDatabase =
+  MessageDatabaseService.instance;
 
   final List<ChatMessage> _messages = [];
   final Set<String> _seenMessageIds = {};
@@ -70,10 +74,44 @@ class ChatService extends ChangeNotifier with WidgetsBindingObserver {
   }
 
   Future<void> _initializeConnectivityAndConnect() async {
+    await _initDatabaseAndLoadMessages();
     await _relayService.initialize();
     await _connectivityService.initialize();
     if (_isStarted && _connectivityService.isNetworkAvailable) {
       _connectRelay();
+    }
+  }
+
+  /// Prunes expired messages and loads non-expired active messages from local SQLite.
+  Future<void> _initDatabaseAndLoadMessages() async {
+    try {
+      final syncNow = _timeSyncService.synchronizedNow;
+      // 1. Clean up any messages in the local database that expired while app was closed
+      await _messageDatabase.deleteExpiredMessages(syncNow);
+
+      // 2. Load active non-expired messages from the database
+      final activeMessages = await _messageDatabase.getActiveMessages(syncNow);
+      if (activeMessages.isNotEmpty) {
+        for (final msg in activeMessages) {
+          if (!_seenMessageIds.contains(msg.id)) {
+            _seenMessageIds.add(msg.id);
+            _messages.add(msg);
+          }
+        }
+        _messages.sort((a, b) => a.createdAt.compareTo(b.createdAt));
+        developer.log(
+          'Loaded ${activeMessages.length} active message(s) from local SQLite database',
+          name: 'ChatService',
+        );
+        notifyListeners();
+      }
+    } catch (e, stack) {
+      developer.log(
+        'Failed to load active messages from SQLite on startup: $e',
+        name: 'ChatService',
+        error: e,
+        stackTrace: stack,
+      );
     }
   }
 
@@ -121,6 +159,7 @@ class ChatService extends ChangeNotifier with WidgetsBindingObserver {
     for (final expired in expiredQueued) {
       _offlineQueue.removeWhere((msg) => msg.id == expired.id);
       _messages.removeWhere((msg) => msg.id == expired.id);
+      unawaited(_messageDatabase.deleteMessage(expired.id));
     }
     if (!_relayService.isConnected) return;
 
@@ -129,10 +168,15 @@ class ChatService extends ChangeNotifier with WidgetsBindingObserver {
       if (msg.isExpired(_timeSyncService.synchronizedNow)) {
         _offlineQueue.removeWhere((queued) => queued.id == msg.id);
         _messages.removeWhere((active) => active.id == msg.id);
+        unawaited(_messageDatabase.deleteMessage(msg.id));
         continue;
       }
       if (_relayService.sendMessage(id: msg.id, text: msg.content)) {
         _offlineQueue.removeWhere((queued) => queued.id == msg.id);
+        if (_connectivityService.isNetworkAvailable) {
+          unawaited(_messageDatabase.saveMessage(msg));
+          developer.log('Flushed queued message saved to database: id=${msg.id}', name: 'ChatService');
+        }
         _lastSendError = null;
       } else {
         _lastSendError = 'Could not send queued message; it remains queued.';
@@ -162,12 +206,23 @@ class ChatService extends ChangeNotifier with WidgetsBindingObserver {
             DateTime.fromMillisecondsSinceEpoch(sentAt, isUtc: true);
         final serverExpiresAt =
             DateTime.fromMillisecondsSinceEpoch(expiresAt, isUtc: true);
-        _messages[existingIndex] = existing.copyWith(
+        final updatedMessage = existing.copyWith(
           status: MessageStatus.delivered,
           createdAt: serverSentAt,
           deliveredAt: serverSentAt,
           expiresAt: serverExpiresAt,
         );
+        _messages[existingIndex] = updatedMessage;
+        final isNetAvailable = _connectivityService.isNetworkAvailable;
+        debugPrint('[SQLITE DIAGNOSTIC] Outgoing Echo received for ID: "$id"');
+        debugPrint('[SQLITE DIAGNOSTIC] _connectivityService.isNetworkAvailable = $isNetAvailable');
+        if (isNetAvailable) {
+          debugPrint('[SQLITE DIAGNOSTIC] Calling _messageDatabase.saveMessage(updatedMessage) for echo...');
+          unawaited(_messageDatabase.saveMessage(updatedMessage));
+          developer.log('Outgoing message echo updated: id=$id', name: 'ChatService');
+        } else {
+          debugPrint('[SQLITE DIAGNOSTIC] SKIPPING saveMessage() for echo because isNetworkAvailable is FALSE!');
+        }
         notifyListeners();
       }
       return;
@@ -205,7 +260,26 @@ class ChatService extends ChangeNotifier with WidgetsBindingObserver {
     );
 
     _messages.add(message);
-    print('RAM RECEIVED MESSAGE ADDED: ${_messages.map((m) => m.content).toList()}');
+    final isNetAvailable = _connectivityService.isNetworkAvailable;
+    debugPrint('================================================================');
+    debugPrint('[SQLITE DIAGNOSTIC] Incoming Peer Message Received:');
+    debugPrint('[SQLITE DIAGNOSTIC] ID: "$id", Sender: "$sender", Content: "$text"');
+    debugPrint('[SQLITE DIAGNOSTIC] _connectivityService.isNetworkAvailable = $isNetAvailable');
+    if (isNetAvailable) {
+      debugPrint('[SQLITE DIAGNOSTIC] Calling _messageDatabase.saveMessage(message) for peer message...');
+      unawaited(_messageDatabase.saveMessage(message));
+      developer.log(
+        'Received peer message saved to local SQLite database: id=$id, sender=$sender',
+        name: 'ChatService',
+      );
+    } else {
+      debugPrint('[SQLITE DIAGNOSTIC] SKIPPING saveMessage() for peer message because isNetworkAvailable is FALSE!');
+      developer.log(
+        'Internet OFF: Received peer message NOT saved to database: id=$id',
+        name: 'ChatService',
+      );
+    }
+    debugPrint('================================================================');
     _messages.sort((a, b) => a.createdAt.compareTo(b.createdAt));
     notifyListeners();
   }
@@ -216,10 +290,24 @@ class ChatService extends ChangeNotifier with WidgetsBindingObserver {
     final index = _messages.indexWhere((m) => m.id == id);
     if (index != -1) {
       final msg = _messages[index];
-      _messages[index] = msg.copyWith(
+      final updated = msg.copyWith(
         status: MessageStatus.delivered,
         deliveryCount: count,
       );
+      _messages[index] = updated;
+      final isNetAvailable = _connectivityService.isNetworkAvailable;
+      debugPrint('[SQLITE DIAGNOSTIC] Delivery confirmation received for ID: "$id" (count: $count)');
+      debugPrint('[SQLITE DIAGNOSTIC] _connectivityService.isNetworkAvailable = $isNetAvailable');
+      if (isNetAvailable) {
+        debugPrint('[SQLITE DIAGNOSTIC] Calling _messageDatabase.saveMessage(updated) for delivery status...');
+        unawaited(_messageDatabase.saveMessage(updated));
+        developer.log(
+          'Delivery count updated in SQLite database: id=$id, count=$count',
+          name: 'ChatService',
+        );
+      } else {
+        debugPrint('[SQLITE DIAGNOSTIC] SKIPPING saveMessage() for delivery status because isNetworkAvailable is FALSE!');
+      }
       notifyListeners();
     }
   }
@@ -232,6 +320,8 @@ class ChatService extends ChangeNotifier with WidgetsBindingObserver {
     final beforeQueue = _offlineQueue.length;
     _messages.removeWhere((m) => m.id == id);
     _offlineQueue.removeWhere((m) => m.id == id);
+    unawaited(_messageDatabase.deleteMessage(id));
+    developer.log('Relay EXPIRED event: deleted id=$id from SQLite and RAM', name: 'ChatService');
     if (_messages.length != beforeMessages || _offlineQueue.length != beforeQueue) {
       notifyListeners();
     }
@@ -345,14 +435,18 @@ class ChatService extends ChangeNotifier with WidgetsBindingObserver {
 
     // 2. Immediately prune expired offline queued messages
     _offlineQueue.removeWhere((msg) => msg.isExpired(syncNow));
+  
+    // 3. Remove expired messages from local database
+    unawaited(_messageDatabase.deleteExpiredMessages(syncNow));
+    developer.log('App resumed: pruned expired messages from RAM and SQLite', name: 'ChatService');
 
-    // 3. Immediately notify UI listeners so display updates in this frame
+    // 4. Immediately notify UI listeners so display updates in this frame
     notifyListeners();
 
-    // 4. Restart timers cleanly without duplicates
+    // 5. Restart timers cleanly without duplicates
     _startTimers();
 
-    // 5. Reconnect to WebSocket relay if disconnected
+    // 6. Reconnect to WebSocket relay if disconnected
     if (!_relayService.isConnected && _connectivityService.isNetworkAvailable) {
       _connectRelay();
     }
@@ -363,18 +457,23 @@ class ChatService extends ChangeNotifier with WidgetsBindingObserver {
   void _tickAndPruneExpired() {
     final syncNow = _timeSyncService.synchronizedNow;
 
-    // Prune active messages
-    final initialCount = _messages.length;
-    _messages.removeWhere(( msg) => msg.isExpired(syncNow));
-    print('RAM MESSAGES AFTER EXPIRY: ${_messages.map((m) => m.content).toList()}');
-    final changed = _messages.length != initialCount;
+    final expired = _messages.where((msg) => msg.isExpired(syncNow)).toList();
+    final expiredQueue = _offlineQueue.where((msg) => msg.isExpired(syncNow)).toList();
 
-    // Prune offline queue - expired offline messages must never be sent
-    final initialQueueCount = _offlineQueue.length;
-    _offlineQueue.removeWhere((msg) => msg.isExpired(syncNow));
-    final queueChanged = _offlineQueue.length != initialQueueCount;
-
-    if (changed || queueChanged) {
+    if (expired.isNotEmpty || expiredQueue.isNotEmpty) {
+      for (final msg in expired) {
+        unawaited(_messageDatabase.deleteMessage(msg.id));
+      }
+      for (final msg in expiredQueue) {
+        unawaited(_messageDatabase.deleteMessage(msg.id));
+      }
+      _messages.removeWhere((msg) => msg.isExpired(syncNow));
+      _offlineQueue.removeWhere((msg) => msg.isExpired(syncNow));
+      unawaited(_messageDatabase.deleteExpiredMessages(syncNow));
+      developer.log(
+        'Auto-pruned ${expired.length} expired message(s) from UI and SQLite',
+        name: 'ChatService',
+      );
       notifyListeners();
     } else {
       if (_messages.isNotEmpty) {
@@ -412,7 +511,21 @@ class ChatService extends ChangeNotifier with WidgetsBindingObserver {
     );
 
     _messages.add(outgoing);
-    print('RAM MESSAGE ADDED: ${_messages.map((m) => m.content).toList()}');
+    final isNetAvailable = _connectivityService.isNetworkAvailable;
+    debugPrint('================================================================');
+    debugPrint('[SQLITE DIAGNOSTIC] Outgoing Message Processing:');
+    debugPrint('[SQLITE DIAGNOSTIC] Message ID: "$messageId", Content: "$trimmed"');
+    debugPrint('[SQLITE DIAGNOSTIC] _connectivityService.isNetworkAvailable = $isNetAvailable');
+    debugPrint('[SQLITE DIAGNOSTIC] _relayService.isConnected = ${_relayService.isConnected}');
+    if (isNetAvailable) {
+      debugPrint('[SQLITE DIAGNOSTIC] Action: Calling _messageDatabase.saveMessage(outgoing)...');
+      unawaited(_messageDatabase.saveMessage(outgoing));
+      developer.log('Outgoing message saved to local SQLite database: id=$messageId', name: 'ChatService');
+    } else {
+      debugPrint('[SQLITE DIAGNOSTIC] Action: SKIPPING saveMessage() because _connectivityService.isNetworkAvailable is FALSE!');
+      developer.log('Internet OFF: Outgoing message NOT saved to database: id=$messageId', name: 'ChatService');
+    }
+    debugPrint('================================================================');
     _lastSendError = null;
     notifyListeners();
 
@@ -453,8 +566,7 @@ class ChatService extends ChangeNotifier with WidgetsBindingObserver {
 
   /// Compatibility method retained for existing UI/tests. This no longer polls HTTP.
   Future<void> pollServerSync() async {
-    final syncNow = _timeSyncService.synchronizedNow;
-    _offlineQueue.removeWhere((msg) => msg.isExpired(syncNow));
+    _tickAndPruneExpired();
     _flushOfflineQueue();
   }
 
@@ -462,12 +574,17 @@ class ChatService extends ChangeNotifier with WidgetsBindingObserver {
   void clearAllMessages() {
     _messages.clear();
     _offlineQueue.clear();
+    unawaited(_messageDatabase.clearAllMessages());
+    developer.log('Cleared all messages from RAM and SQLite', name: 'ChatService');
     notifyListeners();
   }
 
   @visibleForTesting
   void addMessageForTesting(ChatMessage message) {
     _messages.add(message);
+    if (_connectivityService.isNetworkAvailable) {
+      unawaited(_messageDatabase.saveMessage(message));
+    }
     _seenMessageIds.add(message.id);
     notifyListeners();
   }
@@ -494,6 +611,8 @@ class ChatService extends ChangeNotifier with WidgetsBindingObserver {
     _lastSendError = null;
     _isStarted = false;
     _lastLifecycleState = AppLifecycleState.resumed;
+    // ignore: invalid_use_of_visible_for_testing_member
+    _messageDatabase.clearTestRecords();
   }
 
   @visibleForTesting

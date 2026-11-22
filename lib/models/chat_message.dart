@@ -120,6 +120,50 @@ class ChatMessage {
     );
   }
 
+  /// Converts this message into a database map for SQLite persistence.
+  Map<String, dynamic> toDbMap() => {
+        'id': id,
+        'sender_id': senderId,
+        'sender_name': senderName,
+        'content': content,
+        'room': room,
+        'created_at': createdAt.millisecondsSinceEpoch,
+        'delivered_at': deliveredAt?.millisecondsSinceEpoch,
+        'expires_at': expiresAt.millisecondsSinceEpoch,
+        'status': status.name,
+        'delivery_count': deliveryCount,
+      };
+
+  /// Parses a ChatMessage from a local SQLite database row.
+  factory ChatMessage.fromDbMap(Map<String, dynamic> map) {
+    return ChatMessage(
+      id: map['id'] as String,
+      senderId: map['sender_id'] as String,
+      senderName: map['sender_name'] as String,
+      content: map['content'] as String,
+      room: (map['room'] as String?) ?? AppConstants.defaultRoomName,
+      createdAt: DateTime.fromMillisecondsSinceEpoch(
+        map['created_at'] as int,
+        isUtc: true,
+      ),
+      deliveredAt: map['delivered_at'] != null
+          ? DateTime.fromMillisecondsSinceEpoch(
+              map['delivered_at'] as int,
+              isUtc: true,
+            )
+          : null,
+      expiresAt: DateTime.fromMillisecondsSinceEpoch(
+        map['expires_at'] as int,
+        isUtc: true,
+      ),
+      status: MessageStatus.values.firstWhere(
+        (s) => s.name == map['status'],
+        orElse: () => MessageStatus.delivered,
+      ),
+      deliveryCount: map['delivery_count'] as int?,
+    );
+  }
+
   /// Converts this message to the Vanish Relay Protocol v1 SEND format:
   /// `{"type":"message","id":"<unique id>","sender":"<display name>","text":"<message>"}`
   Map<String, dynamic> toProtocolSendJson() => {
